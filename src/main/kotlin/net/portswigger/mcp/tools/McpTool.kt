@@ -16,6 +16,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.serializer
+import net.portswigger.mcp.schema.ParamDoc
 import net.portswigger.mcp.schema.asInputSchema
 import kotlin.experimental.ExperimentalTypeInference
 
@@ -190,6 +191,9 @@ fun String.toLowerSnakeCase(): String {
 }
 
 interface Paginated {
+    @ParamDoc("Number of items to return in this call, from 1 to 100. Larger values are capped at 100; the 'returned' field of the response shows the actual count.")
     val count: Int
+
+    @ParamDoc("Index of the first item to return, starting at 0. To fetch the next page, pass the 'nextOffset' value from the previous response. Must be 0 or more.")
     val offset: Int
 }

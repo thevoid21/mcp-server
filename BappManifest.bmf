@@ -8,6 +8,6 @@ MinPlatformVersion: 26
 ProOnly: False
 Author: Daniel S, PortSwigger & Daniel Allen, PortSwigger
 ShortDescription: Integrate Burp Suite with AI Clients using the Model Context Protocol (MCP).
-EntryPoint: burp-mcp-all.jar
+EntryPoint: burp-mcp-all-1.3.0.jar
 BuildCommand: ./gradlew embedProxyJar
 SupportedProducts: Pro, Community

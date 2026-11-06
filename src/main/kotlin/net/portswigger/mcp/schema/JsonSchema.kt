@@ -5,6 +5,8 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlin.reflect.KClass
+import kotlin.reflect.full.allSuperclasses
+import kotlin.reflect.full.findAnnotation
 import kotlin.reflect.full.memberProperties
 
 fun getJsonSchemaForProperty(kType: kotlin.reflect.KType): JsonElement {
@@ -49,7 +51,14 @@ fun KClass<*>.asInputSchema(): ToolSchema {
     val required = mutableListOf<String>()
 
     for (prop in memberProperties) {
-        properties[prop.name] = getJsonSchemaForProperty(prop.returnType)
+        val schema = getJsonSchemaForProperty(prop.returnType)
+        val description = paramDescriptionFor(prop.name)
+
+        properties[prop.name] = if (description != null) {
+            JsonObject((schema as JsonObject) + ("description" to JsonPrimitive(description)))
+        } else {
+            schema
+        }
 
         if (!prop.returnType.isMarkedNullable) {
             required.add(prop.name)
@@ -61,3 +70,12 @@ fun KClass<*>.asInputSchema(): ToolSchema {
         required = required
     )
 }
+
+/**
+ * Returns the [ParamDoc] text for a property, checking the class first and then its
+ * supertypes, so a description declared on a shared interface applies to every tool.
+ */
+private fun KClass<*>.paramDescriptionFor(name: String): String? =
+    (listOf(this) + allSuperclasses).firstNotNullOfOrNull { type ->
+        type.memberProperties.firstOrNull { it.name == name }?.findAnnotation<ParamDoc>()?.text
+    }

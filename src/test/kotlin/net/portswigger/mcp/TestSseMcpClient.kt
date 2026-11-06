@@ -44,6 +44,10 @@ class TestSseMcpClient {
 
     fun isConnected(): Boolean = connected
 
+    fun serverInstructions(): String? = mcp.serverInstructions
+
+    fun serverVersion(): String? = mcp.serverVersion?.version
+
     suspend fun ping(): EmptyResult {
         try {
             val pingRequest = mcp.ping()

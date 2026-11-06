@@ -6,7 +6,7 @@ Integrates Burp Suite with AI clients (Claude, Cursor, Codex, OpenCode, etc.) us
 
 ## Installation
 
-1. Build: `./gradlew embedProxyJar` → produces `build/libs/burp-mcp-all.jar`
+1. Build: `./gradlew embedProxyJar` → produces `build/libs/burp-mcp-all-<version>.jar`, for example `build/libs/burp-mcp-all-1.3.0.jar`. The version comes from `version` in `gradle.properties`.
 2. Load the JAR as a Burp extension (Extensions → Add → Java)
 3. Configure the MCP tab in Burp (host, port, approvals)
 4. The MCP server listens on `http://127.0.0.1:9876` by default
@@ -109,6 +109,26 @@ Or add manually to `~/.codex/config.toml`:
 [mcp_servers.burpsuite]
 url = "http://127.0.0.1:9876/sse"
 ```
+
+---
+
+## Tool Documentation
+
+AI clients learn how to use this server from what it sends at connect time. There are three layers:
+
+| Layer | What it contains | Where it lives |
+|-------|------------------|----------------|
+| **Server instructions** | How to approach the whole server: paging large histories, sending vs. opening requests, approvals, Professional-only tools. | `SERVER_INSTRUCTIONS` in [`ServerInstructions.kt`](src/main/kotlin/net/portswigger/mcp/tools/ServerInstructions.kt), sent in the MCP `initialize` response. |
+| **Tool descriptions** | What one tool does, its limits, and any side effects (for example "this sends real traffic"). | The description string passed to `mcpTool` in [`Tools.kt`](src/main/kotlin/net/portswigger/mcp/tools/Tools.kt). |
+| **Parameter descriptions** | What each input means, its allowed values, and its default. | `@ParamDoc` on each property in [`ToolParams.kt`](src/main/kotlin/net/portswigger/mcp/tools/ToolParams.kt) and [`McpTool.kt`](src/main/kotlin/net/portswigger/mcp/tools/McpTool.kt) (`Paginated`). Sent as `description` in each property of the tool's JSON input schema. |
+
+Clients differ in how they show server instructions to the model. Tool and parameter descriptions are always sent with the tool list. This README is written for people; the guidance a model receives comes from the three layers above.
+
+### Keeping the documentation current
+
+- Every tool needs a description, and every input property needs a `@ParamDoc`. Tests fail if one is missing (`ToolDocumentationTest`).
+- Put shared parameters on an interface (like `Paginated` or `HttpServiceParams`). The annotation is inherited by every tool that implements it.
+- Write descriptions for the model: state the units and limits (for example "1 to 100"), list allowed values, and say when a tool sends traffic or changes Burp's state.
 
 ---
 

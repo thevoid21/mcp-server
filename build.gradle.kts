@@ -80,6 +80,13 @@ application {
 }
 
 tasks {
+    // Fill the version into mcp-version.properties so the running extension knows its own version.
+    processResources {
+        filesMatching("mcp-version.properties") {
+            expand(mapOf("version" to project.version))
+        }
+    }
+
     test {
         useJUnitPlatform()
         systemProperty("file.encoding", "UTF-8")
@@ -98,6 +105,7 @@ tasks {
 
     shadowJar {
         archiveClassifier.set("")
+        archiveFileName.set("burp-mcp-all-${project.version}.jar")
         mergeServiceFiles()
 
         manifest {

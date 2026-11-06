@@ -4,6 +4,7 @@ import io.ktor.util.network.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import net.portswigger.mcp.AppInfo
 import net.portswigger.mcp.ServerState
 import net.portswigger.mcp.Swing
 import net.portswigger.mcp.config.components.*
@@ -157,10 +158,17 @@ class ConfigUi(private val config: McpConfig, private val providers: List<Provid
         val leftPanel = JPanel(GridBagLayout())
 
         val headerBox = createVerticalBox().apply {
-            add(JLabel("Burp MCP Server").apply {
-                font = Design.Typography.headlineMedium
-                foreground = Design.Colors.onSurface
+            add(createHorizontalBox().apply {
                 alignmentX = CENTER_ALIGNMENT
+                add(JLabel("Burp MCP Server").apply {
+                    font = Design.Typography.headlineMedium
+                    foreground = Design.Colors.onSurface
+                })
+                add(createHorizontalStrut(Design.Spacing.SM))
+                add(JLabel("v${AppInfo.version}").apply {
+                    font = Design.Typography.bodyLarge
+                    foreground = Design.Colors.onSurfaceVariant
+                })
             })
             add(createVerticalStrut(Design.Spacing.MD))
             add(JLabel("Burp MCP Server exposes Burp tooling to AI clients.").apply {
