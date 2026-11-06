@@ -97,29 +97,55 @@ inline fun <reified I : Paginated, J : Any> Server.mcpPaginatedTool(
     })
 }
 
-inline fun <reified I : Paginated> Server.mcpPaginatedTool(
+/** Largest number of items a paginated tool returns in a single call. */
+const val MAX_PAGE_SIZE = 100
+
+/**
+ * Registers a paginated tool that filters first and encodes only the requested page.
+ *
+ * - [select] runs over the whole data set. Keep it cheap: return the matching raw
+ *   items (Burp objects), not strings. Its size becomes the envelope `total`.
+ * - [encode] runs only for items on the requested page, so its cost is bounded by
+ *   `count` (at most [MAX_PAGE_SIZE]) instead of by the size of the history.
+ *
+ * See README "Large histories" for the cost model.
+ */
+inline fun <reified I : Paginated, T> Server.mcpPaginatedTool(
     description: String,
-    crossinline execute: I.() -> Sequence<String>
+    crossinline select: I.() -> List<T>,
+    crossinline encode: I.(T) -> String,
 ) {
     mcpTool<I>(description, execute = {
-        val all = execute(this).toList()
-        val total = all.size
-        val page = if (total == 0 || offset >= total) emptyList() else all.drop(offset).take(count)
-        val nextOffset = offset + page.size
-        val hasMore = nextOffset < total
-
-        val items = JsonArray(page.map { str ->
-            try { Json.parseToJsonElement(str) } catch (_: Exception) { JsonPrimitive(str) }
-        })
-        val envelope = buildJsonObject {
-            put("total", total)
-            put("returned", page.size)
-            put("offset", offset)
-            if (hasMore) put("nextOffset", nextOffset)
-            put("items", items)
-        }
-        listOf(TextContent(Json.encodeToString(JsonElement.serializer(), envelope)))
+        listOf(TextContent(paginate(select(this), offset, count) { encode(this, it) }))
     })
+}
+
+@PublishedApi
+internal fun <T> paginate(
+    matches: List<T>,
+    offset: Int,
+    count: Int,
+    encode: (T) -> String,
+): String {
+    require(offset >= 0) { "offset must be 0 or greater" }
+    require(count >= 1) { "count must be at least 1" }
+
+    val total = matches.size
+    val start = offset.coerceAtMost(total)
+    val end = (start + count.coerceAtMost(MAX_PAGE_SIZE)).coerceAtMost(total)
+
+    val items = JsonArray((start until end).map { index ->
+        val encoded = encode(matches[index])
+        try { Json.parseToJsonElement(encoded) } catch (_: Exception) { JsonPrimitive(encoded) }
+    })
+    val envelope = buildJsonObject {
+        put("total", total)
+        put("returned", items.size)
+        put("offset", offset)
+        if (end < total) put("nextOffset", end)
+        put("items", items)
+    }
+    return Json.encodeToString(JsonElement.serializer(), envelope)
 }
 
 @OptIn(ExperimentalTypeInference::class)

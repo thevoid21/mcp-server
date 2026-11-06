@@ -138,6 +138,8 @@ url = "http://127.0.0.1:9876/sse"
 | `get_proxy_http_history_regex` | Return proxy HTTP history items whose raw content matches a regex. Params: `regex`, `caseInsensitive` (optional), plus all filters. |
 
 > **Output format:** all history tools return a JSON object: `{"total":N,"returned":N,"offset":N,"nextOffset":N,"items":[...]}`. Use `nextOffset` to page. Items with `"_truncated":true` were cut to fit the per-item length limit — re-request with a higher `maxItemLength` to get the full content.
+>
+> **Large histories:** `count` is capped at 100 per call, and each call's cost depends on `count`, not on the size of the history. For 10k–40k items, see [Large Histories](#large-histories).
 
 ### WebSocket History
 
@@ -212,8 +214,8 @@ url = "http://127.0.0.1:9876/sse"
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `count` | int | Number of items to return per page |
-| `offset` | int | Starting position (0-based) |
+| `count` | int | Items per page, 1–100. Larger values are capped at 100 (see `returned`). |
+| `offset` | int | Starting position (0-based). Must be 0 or more. |
 | `newestFirst` | boolean | Return newest items first (default: `true`) |
 
 Response is always a JSON object:
@@ -247,6 +249,67 @@ Response is always a JSON object:
 
 ---
 
+## Large Histories
+
+Proxy and Organizer histories can grow to tens of thousands of items. This section explains how the paging tools work, what they cost, and how to use them on a large history.
+
+### How a page is built
+
+Every paginated history call runs in two phases:
+
+1. **Select.** The server walks the whole history and keeps the items that pass the filters. This phase works on Burp item references and builds no strings. Its result size is `total`.
+2. **Encode.** Only the items on the requested page are serialised to JSON, truncated to `maxItemLength`. Nothing else is encoded.
+
+Before this change, every call encoded every matching item and then discarded most of them. Call cost grew with the size of the history, not with `count`. Walking a 40,000-item history in pages of 20 meant 2,000 calls, each encoding all 40,000 items. The response format did not change.
+
+### Limits
+
+| Parameter | Rule |
+|-----------|------|
+| `count` | 1–100. Values above 100 are capped at 100; check `returned` in the response. Values below 1 return a tool error. |
+| `offset` | 0 or more. Negative values return a tool error. |
+
+If data access is denied, the call returns a tool error (`isError: true`) with the message `HTTP history access denied by Burp Suite` (or the matching label for WebSocket history or Organizer).
+
+### Measured cost
+
+Synthetic benchmark on an Apple Silicon Mac (JVM, after warm-up, minimum of 3 runs). 40,000 items averaging about 7.4 KB of request and response text each. The benchmark called the encoder directly, so it measures encoding only:
+
+| Call | Before | After |
+|------|-------:|------:|
+| One page, `count=20` | 983 ms | 0.7 ms |
+| One page, `count=100` | 983 ms (same work as `count=20`) | 3 ms |
+| Walk all 40,000 items, 20 per page (2,000 calls) | ≈ 33 min | ≈ 1.4 s |
+
+The walk figures are derived: calls × per-call time. The "before" numbers leave out Burp's own cost of turning each message into text, so the real "before" is higher. Filtering still touches every item once per call, so the "after" numbers do not include the filter pass on real Burp objects. Time a single call with `count=1` on your own history to get your real numbers.
+
+### Using large histories
+
+- **Check the size first.** Call `get_proxy_history_count`, or read `total` from any response.
+- **Filter before you page.** `hosts`, `methods`, `statusCodes`, `pathContains`, `mimeTypes`, and `highlightColor` remove items before any output is built. Use a small `count` (10–20) and `headersOnly=true` when you are scanning.
+- **Don't walk the whole history.** Ask for what you need. Use filters for "requests to this host", and a filtered regex for "anything that mentions this".
+- **Narrow filters also speed up regex.** The regex runs only on items that pass the other filters. A broad regex over the full history still scans every body, once per call.
+
+### Known limitations
+
+- **Pages can shift while traffic arrives.** Pages are offset-based. With `newestFirst` (the default), each new request moves older items down one position, so the next page can repeat an item or skip one. Keep pages small, re-check `total`, and narrow filters when precision matters. Stable cursors based on Burp item IDs would fix this and are a possible follow-up.
+- **Regex is a full scan of the filtered set on every call.** There is no index or cache.
+- **The filter pass is O(N) per call.** Each call still reads the metadata of every item once. That is fast for simple checks, but it grows linearly with the history.
+- **Approval prompts repeat per page** when *Require approval for project data access* is on. Choose *Always Allow* for that data type to stop the prompts.
+
+### Design choices
+
+| Option | Verdict |
+|--------|---------|
+| Cache the encoded history | Rejected. Uses a lot of memory and goes stale as traffic arrives. |
+| Let Burp filter for us | Rejected. `ProxyHistoryFilter` is a plain predicate, so Burp does not filter any faster. |
+| Use item IDs as cursors | Deferred. Burp items expose `id()`, which would fix drift. It changes the request contract, so it's a separate change. |
+| **Select, then encode only the page** | **Chosen.** The fix is local to the paginated helper, the response format is unchanged, and per-call cost depends on `count`. |
+
+In the code, see `paginate` and `mcpPaginatedTool` in [`McpTool.kt`](src/main/kotlin/net/portswigger/mcp/tools/McpTool.kt). The unit tests are in [`PaginateTest.kt`](src/test/kotlin/net/portswigger/mcp/tools/PaginateTest.kt).
+
+---
+
 ## Security & Approvals
 
 Two approval layers gate the tools. Both prompt **inside the Burp UI** — watch for dialogs:
@@ -255,9 +318,9 @@ Two approval layers gate the tools. Both prompt **inside the Burp UI** — watch
    on the first request to any host, Burp shows:
    `Allow Once` / `Always Allow Host` / `Always Allow Host:Port` / `Deny`.
    "Always Allow" adds the host to the auto-approve target list (persisted in config).
-2. **Data access approval** (history/Organizer/WebSocket read tools):
-   on first read of each data type, Burp shows:
-   `Allow Once` / `Always Allow <HTTP history|WebSocket history|Organizer items>` / `Deny`.
+2. **Data access approval** (history/Organizer/WebSocket read tools, when *Require approval for project data access* is on):
+   Burp shows `Allow Once` / `Always Allow <HTTP history|WebSocket history|Organizer items>` / `Deny` on **every call**
+   until you pick *Always Allow* for that data type. Paging through history therefore prompts once per page.
    Note: history items may contain sensitive data from previous web sessions.
 
 Additional gates:

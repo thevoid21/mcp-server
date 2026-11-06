@@ -12,6 +12,7 @@ import burp.api.montoya.http.message.requests.HttpRequest
 import burp.api.montoya.organizer.OrganizerItem
 import burp.api.montoya.proxy.ProxyHttpRequestResponse
 import burp.api.montoya.proxy.ProxyWebSocketMessage
+import burp.api.montoya.scanner.audit.issues.AuditIssue
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
@@ -37,6 +38,14 @@ private suspend fun checkDataAccessOrDeny(
     }
     api.logging().logToOutput("MCP $logMessage access granted")
     return true
+}
+
+/** Throws when the user has denied access, so paginated tools report it as a tool error. */
+private fun requireDataAccess(
+    accessType: DataAccessType, config: McpConfig, api: MontoyaApi, label: String
+) {
+    val allowed = runBlocking { checkDataAccessOrDeny(accessType, config, api, label) }
+    if (!allowed) error("$label access denied by Burp Suite")
 }
 
 private fun buildHttp2HeaderList(
@@ -333,9 +342,11 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
     }
 
     if (api.burpSuite().version().edition() == BurpSuiteEdition.PROFESSIONAL) {
-        mcpPaginatedTool<GetScannerIssues>("Displays information about issues identified by the scanner. Returns total count, items returned, and next offset for pagination.") {
-            api.siteMap().issues().asSequence().map { Json.encodeToString(it.toSerializableForm()) }
-        }
+        mcpPaginatedTool<GetScannerIssues, AuditIssue>(
+            "Displays information about issues identified by the scanner. Returns total count, items returned, and next offset for pagination. count is capped at 100 per call.",
+            select = { api.siteMap().issues() },
+            encode = { Json.encodeToString(it.toSerializableForm()) }
+        )
 
         mcpTool(
             "get_scanner_issue_count",
@@ -401,7 +412,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         api.proxy().history().size.toString()
     }
 
-    mcpPaginatedTool<GetProxyHttpHistory>(
+    mcpPaginatedTool<GetProxyHttpHistory, ProxyHttpRequestResponse>(
         "Displays items within the proxy HTTP history. Returns a JSON object with total, returned, offset, " +
         "optional nextOffset, and an items array. Returns newest items first by default. " +
         "Filters: hosts (hostnames), methods ([\"POST\",\"PUT\"]), statusCodes ([200,401,403]), " +
@@ -411,39 +422,35 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         "hasHighlight, editedOnly, hasNotes, inScopeOnly. " +
         "Set headersOnly=true to omit request/response bodies (saves tokens for large JSON APIs). " +
         "Set maxItemLength to raise the 5000-char per-item truncation limit for large cookie jars. " +
-        "Items with _truncated:true were cut to fit the limit."
-    ) {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
-        }
-        if (!allowed) return@mcpPaginatedTool sequenceOf("HTTP history access denied by Burp Suite")
+        "Items with _truncated:true were cut to fit the limit. " +
+        "count is capped at 100 per call; use nextOffset to page. Narrow with filters on large histories.",
+        select = {
+            requireDataAccess(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
+            api.proxy().history()
+                .let { list -> if (newestFirst != false) list.asReversed() else list }
+                .filter { it.matchesFilter(inScopeOnly, hosts, methods, statusCodes, excludeExtensions, mimeTypes, highlightColor, hasHighlight, editedOnly, hasNotes, pathContains) }
+        },
+        encode = { encodeHistoryItem(it.toSerializableForm(headersOnly == true), maxItemLength) }
+    )
 
-        api.proxy().history()
-            .let { list -> if (newestFirst != false) list.asReversed() else list }
-            .filter { it.matchesFilter(inScopeOnly, hosts, methods, statusCodes, excludeExtensions, mimeTypes, highlightColor, hasHighlight, editedOnly, hasNotes, pathContains) }
-            .asSequence()
-            .map { encodeHistoryItem(it.toSerializableForm(headersOnly == true), maxItemLength) }
-    }
-
-    mcpPaginatedTool<GetProxyHttpHistoryRegex>(
+    mcpPaginatedTool<GetProxyHttpHistoryRegex, ProxyHttpRequestResponse>(
         "Displays proxy HTTP history items whose raw content matches the given regex. " +
         "Supports caseInsensitive flag, headersOnly, pathContains, and all filters from get_proxy_http_history. " +
-        "Returns newest items first by default. Output is the same JSON envelope as get_proxy_http_history."
-    ) {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
-        }
-        if (!allowed) return@mcpPaginatedTool sequenceOf("HTTP history access denied by Burp Suite")
+        "Returns newest items first by default. Output is the same JSON envelope as get_proxy_http_history. " +
+        "count is capped at 100 per call; the regex runs only on items that pass the other filters.",
+        select = {
+            requireDataAccess(DataAccessType.HTTP_HISTORY, config, api, "HTTP history")
+            val flags = if (caseInsensitive == true) Pattern.CASE_INSENSITIVE else 0
+            val compiledRegex = Pattern.compile(regex, flags)
 
-        val flags = if (caseInsensitive == true) Pattern.CASE_INSENSITIVE else 0
-        val compiledRegex = Pattern.compile(regex, flags)
-
-        api.proxy().history { it.contains(compiledRegex) }
-            .let { list -> if (newestFirst != false) list.asReversed() else list }
-            .filter { it.matchesFilter(inScopeOnly, hosts, methods, statusCodes, excludeExtensions, mimeTypes, highlightColor, hasHighlight, editedOnly, hasNotes, pathContains) }
-            .asSequence()
-            .map { encodeHistoryItem(it.toSerializableForm(headersOnly == true), maxItemLength) }
-    }
+            api.proxy().history()
+                .let { list -> if (newestFirst != false) list.asReversed() else list }
+                // Cheap metadata filters first, so the regex scans only the items that remain.
+                .filter { it.matchesFilter(inScopeOnly, hosts, methods, statusCodes, excludeExtensions, mimeTypes, highlightColor, hasHighlight, editedOnly, hasNotes, pathContains) }
+                .filter { it.contains(compiledRegex) }
+        },
+        encode = { encodeHistoryItem(it.toSerializableForm(headersOnly == true), maxItemLength) }
+    )
 
     // -----------------------------------------------------------------------
     // Organizer
@@ -460,40 +467,36 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         api.organizer().items().size.toString()
     }
 
-    mcpPaginatedTool<GetOrganizerItems>(
+    mcpPaginatedTool<GetOrganizerItems, OrganizerItem>(
         "Displays items within the Organizer tab. Returns newest items first by default. " +
-        "Supports filtering by: hosts, methods, statusCodes, highlightColor, hasHighlight, hasNotes."
-    ) {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.ORGANIZER, config, api, "Organizer")
-        }
-        if (!allowed) return@mcpPaginatedTool sequenceOf("Organizer access denied by Burp Suite")
+        "Supports filtering by: hosts, methods, statusCodes, highlightColor, hasHighlight, hasNotes. " +
+        "count is capped at 100 per call; use nextOffset to page.",
+        select = {
+            requireDataAccess(DataAccessType.ORGANIZER, config, api, "Organizer")
+            api.organizer().items()
+                .let { list -> if (newestFirst != false) list.asReversed() else list }
+                .filter { it.matchesFilter(hosts, methods, statusCodes, highlightColor, hasHighlight, hasNotes, pathContains) }
+        },
+        encode = { encodeHistoryItem(it.toSerializableForm(headersOnly == true), maxItemLength) }
+    )
 
-        api.organizer().items()
-            .let { list -> if (newestFirst != false) list.asReversed() else list }
-            .filter { it.matchesFilter(hosts, methods, statusCodes, highlightColor, hasHighlight, hasNotes, pathContains) }
-            .asSequence()
-            .map { encodeHistoryItem(it.toSerializableForm(headersOnly == true), maxItemLength) }
-    }
-
-    mcpPaginatedTool<GetOrganizerItemsRegex>(
+    mcpPaginatedTool<GetOrganizerItemsRegex, OrganizerItem>(
         "Displays Organizer items whose raw content matches the given regex. " +
-        "Supports caseInsensitive flag and all filters from get_organizer_items."
-    ) {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.ORGANIZER, config, api, "Organizer")
-        }
-        if (!allowed) return@mcpPaginatedTool sequenceOf("Organizer access denied by Burp Suite")
+        "Supports caseInsensitive flag and all filters from get_organizer_items. " +
+        "count is capped at 100 per call.",
+        select = {
+            requireDataAccess(DataAccessType.ORGANIZER, config, api, "Organizer")
+            val flags = if (caseInsensitive == true) Pattern.CASE_INSENSITIVE else 0
+            val compiledRegex = Pattern.compile(regex, flags)
 
-        val flags = if (caseInsensitive == true) Pattern.CASE_INSENSITIVE else 0
-        val compiledRegex = Pattern.compile(regex, flags)
-
-        api.organizer().items { it.contains(compiledRegex) }
-            .let { list -> if (newestFirst != false) list.asReversed() else list }
-            .filter { it.matchesFilter(hosts, methods, statusCodes, highlightColor, hasHighlight, hasNotes, pathContains) }
-            .asSequence()
-            .map { encodeHistoryItem(it.toSerializableForm(headersOnly == true), maxItemLength) }
-    }
+            api.organizer().items()
+                .let { list -> if (newestFirst != false) list.asReversed() else list }
+                // Cheap metadata filters first, so the regex scans only the items that remain.
+                .filter { it.matchesFilter(hosts, methods, statusCodes, highlightColor, hasHighlight, hasNotes, pathContains) }
+                .filter { it.contains(compiledRegex) }
+        },
+        encode = { encodeHistoryItem(it.toSerializableForm(headersOnly == true), maxItemLength) }
+    )
 
     // -----------------------------------------------------------------------
     // Proxy WebSocket history
@@ -510,42 +513,38 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         api.proxy().webSocketHistory().size.toString()
     }
 
-    mcpPaginatedTool<GetProxyWebsocketHistory>(
+    mcpPaginatedTool<GetProxyWebsocketHistory, ProxyWebSocketMessage>(
         "Displays items within the proxy WebSocket history. Returns newest items first by default. " +
         "Supports filtering by: hosts (upgrade request hostname), " +
         "direction (CLIENT_TO_SERVER or SERVER_TO_CLIENT), " +
-        "highlightColor, hasHighlight, hasNotes."
-    ) {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
-        }
-        if (!allowed) return@mcpPaginatedTool sequenceOf("WebSocket history access denied by Burp Suite")
+        "highlightColor, hasHighlight, hasNotes. " +
+        "count is capped at 100 per call; use nextOffset to page.",
+        select = {
+            requireDataAccess(DataAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
+            api.proxy().webSocketHistory()
+                .let { list -> if (newestFirst != false) list.asReversed() else list }
+                .filter { it.matchesFilter(hosts, direction, highlightColor, hasHighlight, hasNotes) }
+        },
+        encode = { encodeHistoryItem(it.toSerializableForm(), maxItemLength) }
+    )
 
-        api.proxy().webSocketHistory()
-            .let { list -> if (newestFirst != false) list.asReversed() else list }
-            .filter { it.matchesFilter(hosts, direction, highlightColor, hasHighlight, hasNotes) }
-            .asSequence()
-            .map { encodeHistoryItem(it.toSerializableForm(), maxItemLength) }
-    }
-
-    mcpPaginatedTool<GetProxyWebsocketHistoryRegex>(
+    mcpPaginatedTool<GetProxyWebsocketHistoryRegex, ProxyWebSocketMessage>(
         "Displays proxy WebSocket history items whose raw content matches the given regex. " +
-        "Supports caseInsensitive flag and all filters from get_proxy_websocket_history."
-    ) {
-        val allowed = runBlocking {
-            checkDataAccessOrDeny(DataAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
-        }
-        if (!allowed) return@mcpPaginatedTool sequenceOf("WebSocket history access denied by Burp Suite")
+        "Supports caseInsensitive flag and all filters from get_proxy_websocket_history. " +
+        "count is capped at 100 per call.",
+        select = {
+            requireDataAccess(DataAccessType.WEBSOCKET_HISTORY, config, api, "WebSocket history")
+            val flags = if (caseInsensitive == true) Pattern.CASE_INSENSITIVE else 0
+            val compiledRegex = Pattern.compile(regex, flags)
 
-        val flags = if (caseInsensitive == true) Pattern.CASE_INSENSITIVE else 0
-        val compiledRegex = Pattern.compile(regex, flags)
-
-        api.proxy().webSocketHistory { it.contains(compiledRegex) }
-            .let { list -> if (newestFirst != false) list.asReversed() else list }
-            .filter { it.matchesFilter(hosts, direction, highlightColor, hasHighlight, hasNotes) }
-            .asSequence()
-            .map { encodeHistoryItem(it.toSerializableForm(), maxItemLength) }
-    }
+            api.proxy().webSocketHistory()
+                .let { list -> if (newestFirst != false) list.asReversed() else list }
+                // Cheap metadata filters first, so the regex scans only the items that remain.
+                .filter { it.matchesFilter(hosts, direction, highlightColor, hasHighlight, hasNotes) }
+                .filter { it.contains(compiledRegex) }
+        },
+        encode = { encodeHistoryItem(it.toSerializableForm(), maxItemLength) }
+    )
 
     mcpTool<SetTaskExecutionEngineState>("Sets the state of Burp's task execution engine (paused or unpaused)") {
         api.burpSuite().taskExecutionEngine().state = if (running) RUNNING else PAUSED
